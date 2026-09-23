@@ -93,51 +93,83 @@ bool readIntrinsicsAndExtrinsics(std::istream& in, Intrinsics& K, Extrinsics& ex
     return true;
 }
 
-int main(int argc, char* argv[])
+// -----------------------------------------------------------------------------
+// 交互模式：逐步提示用户输入
+// -----------------------------------------------------------------------------
+
+// 读取一个 double，失败时提示重试。返回 false 表示用户要求结束（输入 q 或到达 EOF）
+bool readDoubleInput(const std::string& prompt, double& value)
 {
-    std::ifstream file;
-    if (argc > 1)
+    for (;;)
     {
-        file.open(argv[1]);
-        if (!file)
+        std::cout << prompt << std::flush;
+        std::string token;
+        if (!(std::cin >> token))
         {
-            std::cerr << "Error: cannot open file " << argv[1] << "\n";
-            return EXIT_FAILURE;
+            std::cout << "\n";      // EOF（例如按了 Ctrl+Z），换行后正常退出
+            return false;
+        }
+        if (token == "q" || token == "Q")
+        {
+            std::cout << "\n";
+            return false;
+        }
+        try
+        {
+            value = std::stod(token);   // 能解析成数字就接受
+            return true;
+        }
+        catch (const std::exception&)
+        {
+            // 输入的不是数字（例如输入 abc 或 u=5），提示后 continue 重新问一次
+            std::cout << "  Invalid number, please try again "
+                         "(or type 'q' to quit).\n";
         }
     }
-    std::istream& rawIn = (argc > 1) ? static_cast<std::istream&>(file) : std::cin;
-    CommentSkippingStream input(rawIn);
+}
 
-    int numPoints = 0;
-    if (!(input >> numPoints) || numPoints <= 0)
-    {
-        std::cerr << "Error: the first number must be a positive integer "
-                     "(num_points)\n";
-        return EXIT_FAILURE;
-    }
+// 按提示逐项读取内参与外参
+void readInteractiveInput(Intrinsics& K, Extrinsics& ext)
+{
+    std::cout << "=== Reprojection (interactive mode) ===\n"
+              << "Enter the camera parameters step by step.\n"
+              << "fx/fy/cx/cy are in pixels; t and world points share the same length unit.\n"
+              << "Image width/height are optional; enter 0 to skip the in-frame check.\n\n";
 
-    Intrinsics K;
-    Extrinsics ext;
-    if (!readIntrinsicsAndExtrinsics(input, K, ext))
-    {
-        return EXIT_FAILURE;
-    }
+    std::cout << "[Intrinsics]\n";
+    readDoubleInput("  fx = ", K.fx);
+    readDoubleInput("  fy = ", K.fy);
+    readDoubleInput("  cx = ", K.cx);
+    readDoubleInput("  cy = ", K.cy);
 
-    std::vector<Correspondence> data;
-    data.reserve(static_cast<std::size_t>(numPoints));
-    for (int i = 0; i < numPoints; ++i)
+    double width = 0.0;
+    double height = 0.0;
+    readDoubleInput("  image width  (0 = do not check) = ", width);
+    readDoubleInput("  image height (0 = do not check) = ", height);
+    K.width  = static_cast<int>(width);
+    K.height = static_cast<int>(height);
+
+    std::cout << "\n[Extrinsics] rotation matrix R, row-major (9 numbers)\n";
+    for (int row = 0; row < 3; ++row)
     {
-        Correspondence corr;
-        if (!(input >> corr.world.x >> corr.world.y >> corr.world.z
-                     >> corr.observed.u >> corr.observed.v))
+        for (int col = 0; col < 3; ++col)
         {
-            std::cerr << "Error: failed to read point #" << (i + 1)
-                      << " (5 numbers required: Xw Yw Zw u_obs v_obs)\n";
-            return EXIT_FAILURE;
+            const std::string name =
+                "  r" + std::to_string(row) + std::to_string(col) + " = ";
+            readDoubleInput(name, ext.R.m[row][col]);
         }
-        data.push_back(corr);
     }
 
+    std::cout << "[Extrinsics] translation t (3 numbers)\n";
+    readDoubleInput("  tx = ", ext.t.x);
+    readDoubleInput("  ty = ", ext.t.y);
+    readDoubleInput("  tz = ", ext.t.z);
+    std::cout << "\n";
+}
+
+// 打印相机配置摘要，便于在开始计算前核对参数
+void printCameraConfig(const Intrinsics& K, const Extrinsics& ext)
+{
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "================ Camera configuration ================\n";
     std::cout << "Intrinsics K = [ fx=" << K.fx << ", fy=" << K.fy
@@ -155,14 +187,124 @@ int main(int argc, char* argv[])
     std::cout << "Extrinsics t = [ " << ext.t.x << ", " << ext.t.y << ", "
               << ext.t.z << " ]\n";
     std::cout << "Convention   : Pc = R * Pw + t   (world -> camera)\n\n";
+}
 
-    std::cout << "================ Reprojection result ================\n";
-    std::cout << "  # |       World point Pw        |       Camera point Pc       |"
-                 "     Reprojected      |      Observed       |  Depth   |  Error   | In\n";
-    std::cout << "    |    Xw        Yw        Zw   |    Xc        Yc        Zc   |"
-                 "      u          v     |     u         v     |    Zc    |  (px)    | frame\n";
-    std::cout << "----+-----------------------------+-----------------------------+"
-                 "----------------------+---------------------+----------+----------+-------\n";
+int main(int argc, char* argv[])
+{
+    Intrinsics K;
+    Extrinsics ext;
+    std::vector<Correspondence> data;   // 待计算的匹配对（文件模式与交互模式共用）
+
+    if (argc > 1)
+    {
+        // ---------- 文件模式 ----------
+        std::ifstream file(argv[1]);
+        if (!file)
+        {
+            std::cerr << "Error: cannot open file " << argv[1] << "\n";
+            return EXIT_FAILURE;
+        }
+        CommentSkippingStream input(file);
+
+        int numPoints = 0;
+        if (!(input >> numPoints) || numPoints <= 0)
+        {
+            std::cerr << "Error: the first number must be a positive integer "
+                         "(num_points)\n";
+            return EXIT_FAILURE;
+        }
+
+        if (!readIntrinsicsAndExtrinsics(input, K, ext))
+        {
+            return EXIT_FAILURE;
+        }
+
+        data.reserve(static_cast<std::size_t>(numPoints));
+        for (int i = 0; i < numPoints; ++i)
+        {
+            Correspondence corr;
+            if (!(input >> corr.world.x >> corr.world.y >> corr.world.z
+                         >> corr.observed.u >> corr.observed.v))
+            {
+                std::cerr << "Error: failed to read point #" << (i + 1)
+                          << " (5 numbers required: Xw Yw Zw u_obs v_obs)\n";
+                return EXIT_FAILURE;
+            }
+            data.push_back(corr);
+        }
+    }
+    else
+    {
+        // ---------- 交互模式 ----------
+        readInteractiveInput(K, ext);
+        printCameraConfig(K, ext);          // 先让用户核对一遍参数
+        std::cout << "=== Enter points one by one; type 'q' at Xw to finish ===\n";
+        for (;;)
+        {
+            Correspondence corr;
+            std::cout << "\n--- Point " << (data.size() + 1) << " ---\n";
+
+            double x = 0.0;
+            if (!readDoubleInput("  Xw = ", x))
+            {
+                break;                          // 输入 q 或 EOF，结束录入
+            }
+            corr.world.x = x;
+            readDoubleInput("  Yw = ", corr.world.y);
+            readDoubleInput("  Zw = ", corr.world.z);
+            readDoubleInput("  observed u = ", corr.observed.u);
+            readDoubleInput("  observed v = ", corr.observed.v);
+
+            data.push_back(corr);
+
+            // 每输入一个点就立刻给出结果，不用等到最后
+            const Point3     Pc = worldToCamera(ext, corr.world);
+            const Evaluation e  = evaluate(K, ext, corr);
+
+            std::cout << std::fixed << std::setprecision(4);
+            std::cout << "  Pc        = (" << Pc.x << ", " << Pc.y << ", " << Pc.z << ")\n";
+            std::cout << "  depth Zc  = " << Pc.z << "\n";
+            if (!e.valid)
+            {
+                std::cout << "  result    = INVALID (" << e.reason << ")\n";
+            }
+            else
+            {
+                std::cout << "  projected = (" << e.reprojected.u << ", "
+                          << e.reprojected.v << ")\n";
+                std::cout << "  observed  = (" << e.observed.u << ", "
+                          << e.observed.v << ")\n";
+                std::cout << "  error     = " << e.error << " px\n";
+            }
+        }
+    }
+
+    if (data.empty())
+    {
+        std::cerr << "No point was given.\n";
+        return EXIT_FAILURE;
+    }
+
+    // 文件模式在这里打印配置；
+    // 交互模式已在录入完成后立即打印过（见上面 else 分支），这里不能重复打印
+    if (argc > 1)
+    {
+        printCameraConfig(K, ext);
+    }
+
+    // 交互模式下每个点的结果已经在输入时逐点打印过，这里就不再重复打表格
+    const bool printTable = (argc > 1);
+
+    if (printTable)
+    {
+        std::cout << "================ Reprojection result ================\n";
+        std::cout << "  # |       World point Pw        |       Camera point Pc       |"
+                     "     Reprojected      |      Observed       |  Depth   |  Error   | In\n";
+        std::cout << "    |    Xw        Yw        Zw   |    Xc        Yc        Zc   |"
+                     "      u          v     |     u         v     |    Zc    |  (px)    | frame\n";
+        std::cout << "----+-----------------------------+-----------------------------+"
+                     "----------------------+---------------------+----------+----------+-------\n";
+    }
 
     double sumError        = 0.0;
     double sumSquaredError = 0.0;
@@ -176,21 +318,27 @@ int main(int argc, char* argv[])
         const Point3     Pc = worldToCamera(ext, corr.world);
         const Evaluation e  = evaluate(K, ext, corr);
 
-        std::cout << std::setw(3) << (i + 1) << " | "
-                  << std::setw(8) << corr.world.x << " "
-                  << std::setw(8) << corr.world.y << " "
-                  << std::setw(8) << corr.world.z << " | "
-                  << std::setw(8) << Pc.x << " "
-                  << std::setw(8) << Pc.y << " "
-                  << std::setw(8) << Pc.z << " | ";
+        if (printTable)
+        {
+            std::cout << std::setw(3) << (i + 1) << " | "
+                      << std::setw(8) << corr.world.x << " "
+                      << std::setw(8) << corr.world.y << " "
+                      << std::setw(8) << corr.world.z << " | "
+                      << std::setw(8) << Pc.x << " "
+                      << std::setw(8) << Pc.y << " "
+                      << std::setw(8) << Pc.z << " | ";
+        }
 
         if (!e.valid)
         {
-            std::cout << std::setw(20) << "INVALID" << " | "
-                      << std::setw(10) << "-" << " " << std::setw(8) << "-" << " | "
-                      << std::setw(8) << "-" << " | "
-                      << std::setw(8) << "-" << " | "
-                      << "  -   " << "  <- " << e.reason << "\n";
+            if (printTable)
+            {
+                std::cout << std::setw(20) << "INVALID" << " | "
+                          << std::setw(10) << "-" << " " << std::setw(8) << "-" << " | "
+                          << std::setw(8) << "-" << " | "
+                          << std::setw(8) << "-" << " | "
+                          << "  -   " << "  <- " << e.reason << "\n";
+            }
             continue;
         }
 
@@ -205,13 +353,16 @@ int main(int argc, char* argv[])
         sumSquaredError += e.error * e.error;
         maxError = std::max(maxError, e.error);
 
-        std::cout << std::setw(9) << e.reprojected.u << " "
-                  << std::setw(9) << e.reprojected.v << "  | "
-                  << std::setw(9) << e.observed.u << " "
-                  << std::setw(9) << e.observed.v << "  | "
-                  << std::setw(8) << e.depth << " | "
-                  << std::setw(8) << e.error << " | "
-                  << (inside ? " yes " : " no  ") << "\n";
+        if (printTable)
+        {
+            std::cout << std::setw(9) << e.reprojected.u << " "
+                      << std::setw(9) << e.reprojected.v << "  | "
+                      << std::setw(9) << e.observed.u << " "
+                      << std::setw(9) << e.observed.v << "  | "
+                      << std::setw(8) << e.depth << " | "
+                      << std::setw(8) << e.error << " | "
+                      << (inside ? " yes " : " no  ") << "\n";
+        }
     }
 
     std::cout << "\n================ Summary ================\n";
