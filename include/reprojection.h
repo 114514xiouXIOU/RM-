@@ -1,8 +1,8 @@
 // reprojection.h -- 针孔模型重投影与误差评估接口
 //
 // 流程：
-//   1) worldToCamera()      世界点 -> 相机点
-//   2) projectCameraPoint() 深度检查、透视除法、内参映射 -> 像素
+//   1) worldToCamera()      世界点到相机点
+//   2) projectCameraPoint() 深度检查、透视除法、内参映射到像素
 //   3) pixelDistance()      与观测点的像素欧氏距离
 
 #ifndef REPROJECT_REPROJECTION_H
